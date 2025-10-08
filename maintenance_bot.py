@@ -4,7 +4,8 @@ from discord.ext import tasks
 import json
 import os
 import os.path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from dateutil.relativedelta import relativedelta
 import asyncio
 import logging
 from dotenv import load_dotenv
@@ -42,10 +43,12 @@ except ValueError:
     CHECK_INTERVAL_SECONDS = DEFAULT_CHECK_INTERVAL
 
 # Data storage file path
-DATA_FILE = "/bot/data/maintenancebot_data.json"
+# Use environment variable if set, otherwise use ./data/ for local development
+DATA_DIR = os.getenv("DATA_DIR", "./data")
+DATA_FILE = os.path.join(DATA_DIR, "maintenancebot_data.json")
 
 # Versioning info
-VERSION_FILE = "/bot/version.json"
+VERSION_FILE = os.path.join(DATA_DIR, "version.json")
 CURRENT_VERSION = "0.0.0"  # Default version if no version file exists
 RELEASE_NOTES = ""
 NEW_VERSION_DETECTED = False
@@ -68,36 +71,32 @@ if not BOT_TOKEN:
     logging.critical("CRITICAL ERROR: DISCORD_BOT_TOKEN not found in .env file or environment variables.")
     exit("Bot token is missing. Please check your .env file.")
 
-# --- Global Settings ---
-global_settings = {
-    "reminder_repeat_days": REMINDER_REPEAT_DAYS_DEFAULT_ENV
-}
-
 # --- Global Timers Dictionary ---
+# Structure: {guild_id: {"timers": {...}, "settings": {"reminder_repeat_days": int}}}
 timers = {}
 
 # --- Helper Functions ---
 def save_data():
-    """Saves the current state of timers and global settings to the JSON file."""
-    global timers, global_settings
+    """Saves the current state of timers and per-guild settings to the JSON file."""
+    global timers
     try:
-        serializable_timers = {}
-        for guild_id, guild_timers in timers.items():
-            serializable_timers[str(guild_id)] = {}
-            for name, data in guild_timers.items():
-                serializable_data = data.copy()
-                if isinstance(serializable_data.get("next_due"), datetime):
-                    serializable_data["next_due"] = serializable_data["next_due"].isoformat()
-                if isinstance(serializable_data.get("last_reminded"), datetime):
-                    serializable_data["last_reminded"] = serializable_data["last_reminded"].isoformat()
-                serializable_data.pop("reminder_repeat_days", None)
-                serializable_timers[str(guild_id)][name] = serializable_data
-        data_to_save = {
-            "global_settings": global_settings,
-            "timers": serializable_timers
-        }
+        serializable_data = {}
+        for guild_id, guild_data in timers.items():
+            serializable_guild = {
+                "settings": guild_data.get("settings", {"reminder_repeat_days": REMINDER_REPEAT_DAYS_DEFAULT_ENV}),
+                "timers": {}
+            }
+            for name, timer_data in guild_data.get("timers", {}).items():
+                serialized_timer = timer_data.copy()
+                if isinstance(serialized_timer.get("next_due"), datetime):
+                    serialized_timer["next_due"] = serialized_timer["next_due"].isoformat()
+                if isinstance(serialized_timer.get("last_reminded"), datetime):
+                    serialized_timer["last_reminded"] = serialized_timer["last_reminded"].isoformat()
+                serializable_guild["timers"][name] = serialized_timer
+            serializable_data[str(guild_id)] = serializable_guild
+
         with open(DATA_FILE, 'w') as f:
-            json.dump(data_to_save, f, indent=4)
+            json.dump(serializable_data, f, indent=4)
         logger.info(f"Data saved to {DATA_FILE}")
     except IOError as e:
         logger.error(f"Error saving data to {DATA_FILE}: {e}")
@@ -105,48 +104,80 @@ def save_data():
         logger.error(f"Unexpected error during data serialization: {e}")
 
 def load_data():
-    """Loads timers and global settings from the JSON file."""
-    global timers, global_settings
+    """Loads timers and per-guild settings from the JSON file."""
+    global timers
     if not os.path.exists(DATA_FILE):
         timers = {}
-        logger.warning(f"{DATA_FILE} not found. Using default global settings from .env/code.")
+        logger.warning(f"{DATA_FILE} not found. Will use default settings from .env/code.")
         return
     try:
         with open(DATA_FILE, 'r') as f:
             loaded_data = json.load(f)
-        loaded_settings = loaded_data.get("global_settings", {})
-        global_settings["reminder_repeat_days"] = loaded_settings.get(
-            "reminder_repeat_days", global_settings["reminder_repeat_days"]
-        )
-        loaded_timers_data = loaded_data.get("timers", {})
-        timers = {}
-        for guild_id_str, guild_timers_data in loaded_timers_data.items():
-            try:
-                guild_id = int(guild_id_str)
-                timers[guild_id] = {}
-                for name, data in guild_timers_data.items():
-                    deserialized_data = data.copy()
-                    deserialized_data.pop("reminder_repeat_days", None)
-                    if deserialized_data.get("next_due"):
-                        try:
-                            deserialized_data["next_due"] = datetime.fromisoformat(deserialized_data["next_due"])
-                        except (ValueError, TypeError):
-                            logger.warning(f"Could not parse next_due for timer '{name}' in guild {guild_id}. Setting to None.")
-                            deserialized_data["next_due"] = None
-                    if deserialized_data.get("last_reminded"):
-                        try:
-                            deserialized_data["last_reminded"] = datetime.fromisoformat(deserialized_data["last_reminded"])
-                        except (ValueError, TypeError):
-                            logger.warning(f"Could not parse last_reminded for timer '{name}' in guild {guild_id}. Setting to None.")
-                            deserialized_data["last_reminded"] = None
-                    timers[guild_id][name] = deserialized_data
-            except ValueError:
-                logger.error(f"Invalid guild ID '{guild_id_str}' found in {DATA_FILE}. Skipping.")
-                continue
+
+        # Handle old data format (migration)
+        if "global_settings" in loaded_data and "timers" in loaded_data:
+            logger.info("Migrating from old data format to per-guild settings...")
+            old_global_settings = loaded_data.get("global_settings", {})
+            old_timers = loaded_data.get("timers", {})
+            timers = {}
+            for guild_id_str, guild_timers_data in old_timers.items():
+                try:
+                    guild_id = int(guild_id_str)
+                    timers[guild_id] = {
+                        "settings": {"reminder_repeat_days": old_global_settings.get("reminder_repeat_days", REMINDER_REPEAT_DAYS_DEFAULT_ENV)},
+                        "timers": {}
+                    }
+                    for name, timer_data in guild_timers_data.items():
+                        deserialized_timer = timer_data.copy()
+                        if deserialized_timer.get("next_due"):
+                            try:
+                                deserialized_timer["next_due"] = datetime.fromisoformat(deserialized_timer["next_due"])
+                            except (ValueError, TypeError):
+                                logger.warning(f"Could not parse next_due for timer '{name}' in guild {guild_id}. Setting to None.")
+                                deserialized_timer["next_due"] = None
+                        if deserialized_timer.get("last_reminded"):
+                            try:
+                                deserialized_timer["last_reminded"] = datetime.fromisoformat(deserialized_timer["last_reminded"])
+                            except (ValueError, TypeError):
+                                logger.warning(f"Could not parse last_reminded for timer '{name}' in guild {guild_id}. Setting to None.")
+                                deserialized_timer["last_reminded"] = None
+                        timers[guild_id]["timers"][name] = deserialized_timer
+                except ValueError:
+                    logger.error(f"Invalid guild ID '{guild_id_str}' found. Skipping.")
+                    continue
+            save_data()  # Save in new format
+        else:
+            # New data format
+            timers = {}
+            for guild_id_str, guild_data in loaded_data.items():
+                try:
+                    guild_id = int(guild_id_str)
+                    timers[guild_id] = {
+                        "settings": guild_data.get("settings", {"reminder_repeat_days": REMINDER_REPEAT_DAYS_DEFAULT_ENV}),
+                        "timers": {}
+                    }
+                    for name, timer_data in guild_data.get("timers", {}).items():
+                        deserialized_timer = timer_data.copy()
+                        if deserialized_timer.get("next_due"):
+                            try:
+                                deserialized_timer["next_due"] = datetime.fromisoformat(deserialized_timer["next_due"])
+                            except (ValueError, TypeError):
+                                logger.warning(f"Could not parse next_due for timer '{name}' in guild {guild_id}. Setting to None.")
+                                deserialized_timer["next_due"] = None
+                        if deserialized_timer.get("last_reminded"):
+                            try:
+                                deserialized_timer["last_reminded"] = datetime.fromisoformat(deserialized_timer["last_reminded"])
+                            except (ValueError, TypeError):
+                                logger.warning(f"Could not parse last_reminded for timer '{name}' in guild {guild_id}. Setting to None.")
+                                deserialized_timer["last_reminded"] = None
+                        timers[guild_id]["timers"][name] = deserialized_timer
+                except ValueError:
+                    logger.error(f"Invalid guild ID '{guild_id_str}' found. Skipping.")
+                    continue
+
         logger.info(f"Data loaded successfully from {DATA_FILE}")
-        logger.info(f"Using global reminder interval: {global_settings['reminder_repeat_days']} days")
     except (IOError, json.JSONDecodeError) as e:
-        logger.error(f"Error loading data from {DATA_FILE}: {e}. Using default global settings.")
+        logger.error(f"Error loading data from {DATA_FILE}: {e}. Using defaults.")
         timers = {}
     except Exception as e:
         logger.error(f"Unexpected error during data deserialization: {e}")
@@ -154,18 +185,20 @@ def load_data():
 
 def calculate_next_due(interval_value, interval_unit, start_time=None):
     if start_time is None:
-        start_time = datetime.utcnow()
-    
+        start_time = datetime.now(timezone.utc)
+
     # Normalize to start of day
     start_time = start_time.replace(hour=0, minute=0, second=0, microsecond=0)
-    
-    delta = None
+
     unit = interval_unit.lower()
-    if unit == "days": delta = timedelta(days=interval_value)
-    elif unit == "weeks": delta = timedelta(weeks=interval_value)
-    elif unit == "months": delta = timedelta(days=interval_value * 30); logger.warning("Using approximation for 'months' (30 days).")
-    else: raise ValueError("Invalid interval unit. Use 'days', 'weeks', or 'months'.")
-    return start_time + delta if delta else None
+    if unit == "days":
+        return start_time + timedelta(days=interval_value)
+    elif unit == "weeks":
+        return start_time + timedelta(weeks=interval_value)
+    elif unit == "months":
+        return start_time + relativedelta(months=interval_value)
+    else:
+        raise ValueError("Invalid interval unit. Use 'days', 'weeks', or 'months'.")
 
 def strfdelta(tdelta, fmt):
     d = {"days": tdelta.days}
@@ -359,17 +392,19 @@ bot = MaintenanceBot()
 @tasks.loop(seconds=DEFAULT_CHECK_INTERVAL)
 async def check_timers_task():
     """Periodically checks all timers and sends reminders if due."""
-    global timers, global_settings
-    now = datetime.utcnow()
+    global timers
+    now = datetime.now(timezone.utc)
     data_to_save = False
-    reminder_interval_days = global_settings.get("reminder_repeat_days", REMINDER_REPEAT_DAYS_DEFAULT_ENV)
     guild_ids = list(timers.keys())
     for guild_id in guild_ids:
         if guild_id not in timers: continue
-        timer_names = list(timers.get(guild_id, {}).keys())
+        guild_data = timers[guild_id]
+        guild_settings = guild_data.get("settings", {"reminder_repeat_days": REMINDER_REPEAT_DAYS_DEFAULT_ENV})
+        reminder_interval_days = guild_settings.get("reminder_repeat_days", REMINDER_REPEAT_DAYS_DEFAULT_ENV)
+        timer_names = list(guild_data.get("timers", {}).keys())
         for name in timer_names:
-            if guild_id not in timers or name not in timers.get(guild_id, {}): continue
-            timer_data = timers[guild_id][name]
+            if guild_id not in timers or name not in timers[guild_id].get("timers", {}): continue
+            timer_data = timers[guild_id]["timers"][name]
             timer_channel_id = timer_data.get("channel_id")
             channel = bot.get_channel(timer_channel_id)
             if not channel:
@@ -389,8 +424,8 @@ async def check_timers_task():
                         timestamp=now
                     )
                     await channel.send(embed=embed)
-                    timers[guild_id][name]["is_pending"] = True
-                    timers[guild_id][name]["last_reminded"] = now
+                    timers[guild_id]["timers"][name]["is_pending"] = True
+                    timers[guild_id]["timers"][name]["last_reminded"] = now
                     data_to_save = True
                     logger.info(f"Sent initial reminder for '{name}' in guild {guild_id}, channel {channel.id}.")
                 # Check 2: Pending Reminder Repeat
@@ -405,7 +440,7 @@ async def check_timers_task():
                             timestamp=now
                         )
                         await channel.send(f"cc: {timer_data['owner']}", embed=embed)
-                        timers[guild_id][name]["last_reminded"] = now
+                        timers[guild_id]["timers"][name]["last_reminded"] = now
                         data_to_save = True
                         logger.info(f"Sent repeat reminder for '{name}' in guild {guild_id}, channel {channel.id}.")
             except discord.errors.Forbidden:
@@ -443,7 +478,12 @@ async def create_timer(interaction: discord.Interaction, name: str, interval_val
         
     guild_id = interaction.guild.id
     channel_id = interaction.channel.id
-    
+
+    # Validate timer name (no spaces)
+    if ' ' in name:
+        await interaction.response.send_message("❌ Error: Timer name cannot contain spaces.", ephemeral=True)
+        return
+
     if interval_value <= 0:
         await interaction.response.send_message("❌ Error: Interval value must be positive.", ephemeral=True)
         return
@@ -454,18 +494,21 @@ async def create_timer(interaction: discord.Interaction, name: str, interval_val
         return
         
     if guild_id not in timers:
-        timers[guild_id] = {}
-        
-    if name in timers[guild_id]:
+        timers[guild_id] = {
+            "settings": {"reminder_repeat_days": REMINDER_REPEAT_DAYS_DEFAULT_ENV},
+            "timers": {}
+        }
+
+    if name in timers[guild_id].get("timers", {}):
         await interaction.response.send_message(f"❌ Error: A timer with the name '{name}' already exists in this server.", ephemeral=True)
         return
-        
+
     try:
         next_due_time = calculate_next_due(interval_value, interval_unit)
         if not next_due_time:
             await interaction.response.send_message(f"❌ Error: Could not calculate next due date with unit '{interval_unit}'.", ephemeral=True)
             return
-            
+
         new_timer = {
             "name": name,
             "interval_value": interval_value,
@@ -477,13 +520,14 @@ async def create_timer(interaction: discord.Interaction, name: str, interval_val
             "is_pending": False,
             "last_reminded": None
         }
-        
-        timers[guild_id][name] = new_timer
+
+        timers[guild_id]["timers"][name] = new_timer
         save_data()
-        
+
+        guild_reminder_days = timers[guild_id]["settings"].get("reminder_repeat_days", REMINDER_REPEAT_DAYS_DEFAULT_ENV)
         await interaction.response.send_message(
             f"✅ Timer '{name}' created successfully!\nIt will first trigger on {discord_date(next_due_time)}.\n"
-            f"Pending reminders will repeat every {global_settings['reminder_repeat_days']} days (global setting)."
+            f"Pending reminders will repeat every {guild_reminder_days} days (server setting)."
         )
         logger.info(f"Timer '{name}' created in guild {guild_id} by {interaction.user.name}.")
         
@@ -494,8 +538,27 @@ async def create_timer(interaction: discord.Interaction, name: str, interval_val
         logger.error(f"Error creating timer '{name}' in guild {guild_id}: {e}", exc_info=True)
 
 
+async def timer_name_autocomplete(interaction: discord.Interaction, current: str):
+    """Autocomplete function for timer names."""
+    if not interaction.guild:
+        return []
+
+    guild_id = interaction.guild.id
+    if guild_id not in timers or "timers" not in timers[guild_id]:
+        return []
+
+    # Filter timer names based on current input
+    choices = [
+        app_commands.Choice(name=timer_name, value=timer_name)
+        for timer_name in timers[guild_id]["timers"].keys()
+        if current.lower() in timer_name.lower()
+    ]
+    # Limit to 25 choices as per Discord's limit
+    return choices[:25]
+
 @bot.tree.command(name="done", description="Marks a pending maintenance timer as completed")
 @app_commands.describe(name="The name of the timer to mark as done")
+@app_commands.autocomplete(name=timer_name_autocomplete)
 async def done_timer(interaction: discord.Interaction, name: str):
     """Marks a specific maintenance task as done for its current cycle."""
     if not interaction.guild:
@@ -503,12 +566,12 @@ async def done_timer(interaction: discord.Interaction, name: str):
         return
         
     guild_id = interaction.guild.id
-    
-    if guild_id not in timers or name not in timers[guild_id]:
+
+    if guild_id not in timers or name not in timers[guild_id].get("timers", {}):
         await interaction.response.send_message(f"❌ Error: Timer '{name}' not found.", ephemeral=True)
         return
-        
-    timer_data = timers[guild_id][name]
+
+    timer_data = timers[guild_id]["timers"][name]
     
     if not timer_data.get("is_pending", False):
         await interaction.response.send_message(f"ℹ️ Timer '{name}' was not pending completion.", ephemeral=True)
@@ -522,10 +585,10 @@ async def done_timer(interaction: discord.Interaction, name: str):
         if not next_due_time:
             await interaction.response.send_message(f"❌ Error: Could not recalculate next due date for timer '{name}'.", ephemeral=True)
             return
-            
-        timers[guild_id][name]["is_pending"] = False
-        timers[guild_id][name]["last_reminded"] = None
-        timers[guild_id][name]["next_due"] = next_due_time
+
+        timers[guild_id]["timers"][name]["is_pending"] = False
+        timers[guild_id]["timers"][name]["last_reminded"] = None
+        timers[guild_id]["timers"][name]["next_due"] = next_due_time
         save_data()
         
         await interaction.response.send_message(
@@ -548,16 +611,19 @@ async def list_timers_cmd(interaction: discord.Interaction):
         return
     
     guild_id = interaction.guild.id
-    
-    if guild_id not in timers or not timers[guild_id]:
+
+    if guild_id not in timers or not timers[guild_id].get("timers", {}):
         await interaction.response.send_message("ℹ️ No maintenance timers are set up.", ephemeral=True)
         return
-    
+
+    guild_settings = timers[guild_id].get("settings", {"reminder_repeat_days": REMINDER_REPEAT_DAYS_DEFAULT_ENV})
+    reminder_days = guild_settings.get("reminder_repeat_days", REMINDER_REPEAT_DAYS_DEFAULT_ENV)
+
     embed = discord.Embed(title=f"Maintenance Timers for {interaction.guild.name}", color=discord.Color.blue())
-    embed.set_footer(text=f"Global pending reminder interval: {global_settings['reminder_repeat_days']} days")
-    
-    now = datetime.utcnow()
-    sorted_timers = sorted(timers[guild_id].values(), key=lambda t: t.get('next_due') or datetime.max.replace(tzinfo=None))
+    embed.set_footer(text=f"Server pending reminder interval: {reminder_days} days")
+
+    now = datetime.now(timezone.utc)
+    sorted_timers = sorted(timers[guild_id]["timers"].values(), key=lambda t: t.get('next_due') or datetime.max.replace(tzinfo=timezone.utc))
     
     for timer_data in sorted_timers:
         name = timer_data['name']
@@ -599,6 +665,7 @@ async def list_timers_cmd(interaction: discord.Interaction):
 
 @bot.tree.command(name="delete_timer", description="Permanently deletes a maintenance timer")
 @app_commands.describe(name="The name of the timer to delete")
+@app_commands.autocomplete(name=timer_name_autocomplete)
 async def delete_timer(interaction: discord.Interaction, name: str):
     """Removes a maintenance timer permanently. Requires 'Manage Server' permission."""
     if not interaction.guild:
@@ -611,14 +678,15 @@ async def delete_timer(interaction: discord.Interaction, name: str):
         return
     
     guild_id = interaction.guild.id
-    
-    if guild_id not in timers or name not in timers.get(guild_id, {}):
+
+    if guild_id not in timers or name not in timers[guild_id].get("timers", {}):
         await interaction.response.send_message(f"❌ Error: Timer '{name}' not found.", ephemeral=True)
         return
-    
+
     try:
-        del timers[guild_id][name]
-        if not timers[guild_id]:
+        del timers[guild_id]["timers"][name]
+        # Clean up guild data if no timers left
+        if not timers[guild_id]["timers"]:
             del timers[guild_id]
         save_data()
         await interaction.response.send_message(f"🗑️ Timer '{name}' has been deleted.")
@@ -628,38 +696,55 @@ async def delete_timer(interaction: discord.Interaction, name: str):
         logger.error(f"Error deleting timer '{name}' in guild {guild_id}: {e}", exc_info=True)
 
 
-@bot.tree.command(name="get_reminder_interval", description="Shows the global interval for pending reminders")
+@bot.tree.command(name="get_reminder_interval", description="Shows this server's interval for pending reminders")
 async def get_reminder_interval(interaction: discord.Interaction):
-    """Displays the current global setting for how often pending tasks are re-notified."""
-    current_interval = global_settings.get("reminder_repeat_days", "Not Set")
-    await interaction.response.send_message(f"ℹ️ Pending tasks are reminded every **{current_interval}** days globally.")
-
-
-@bot.tree.command(name="set_reminder_interval", description="Sets the global interval (days) for pending reminders")
-@app_commands.describe(days="The number of days between reminders for pending tasks")
-async def set_reminder_interval(interaction: discord.Interaction, days: int):
-    """Sets the global reminder interval for pending tasks. Requires 'Manage Server' permission."""
+    """Displays the current server setting for how often pending tasks are re-notified."""
     if not interaction.guild:
         await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
         return
-    
+
+    guild_id = interaction.guild.id
+    if guild_id in timers:
+        guild_settings = timers[guild_id].get("settings", {"reminder_repeat_days": REMINDER_REPEAT_DAYS_DEFAULT_ENV})
+        current_interval = guild_settings.get("reminder_repeat_days", REMINDER_REPEAT_DAYS_DEFAULT_ENV)
+    else:
+        current_interval = REMINDER_REPEAT_DAYS_DEFAULT_ENV
+
+    await interaction.response.send_message(f"ℹ️ Pending tasks are reminded every **{current_interval}** days in this server.")
+
+
+@bot.tree.command(name="set_reminder_interval", description="Sets this server's interval (days) for pending reminders")
+@app_commands.describe(days="The number of days between reminders for pending tasks")
+async def set_reminder_interval(interaction: discord.Interaction, days: int):
+    """Sets the server's reminder interval for pending tasks. Requires 'Manage Server' permission."""
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
     # Check permissions
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message("❌ You need 'Manage Server' permission to use this command.", ephemeral=True)
         return
-    
+
     if days <= 0:
         await interaction.response.send_message("❌ Error: Interval must be positive.", ephemeral=True)
         return
-    
+
     try:
-        global_settings["reminder_repeat_days"] = days
+        guild_id = interaction.guild.id
+        if guild_id not in timers:
+            timers[guild_id] = {
+                "settings": {"reminder_repeat_days": days},
+                "timers": {}
+            }
+        else:
+            timers[guild_id]["settings"]["reminder_repeat_days"] = days
         save_data()
-        await interaction.response.send_message(f"✅ Global reminder interval set to **{days}** days.")
-        logger.info(f"Global reminder interval changed to {days} days by {interaction.user.name} ({interaction.user.id}).")
+        await interaction.response.send_message(f"✅ Server reminder interval set to **{days}** days.")
+        logger.info(f"Server {guild_id} reminder interval changed to {days} days by {interaction.user.name} ({interaction.user.id}).")
     except Exception as e:
         await interaction.response.send_message("❌ Error saving interval.", ephemeral=True)
-        logger.error(f"Error setting global reminder interval: {e}", exc_info=True)
+        logger.error(f"Error setting server reminder interval: {e}", exc_info=True)
 
 @bot.tree.command(name="edit_timer", description="Edits an existing maintenance timer")
 @app_commands.describe(
@@ -669,12 +754,13 @@ async def set_reminder_interval(interaction: discord.Interaction, days: int):
     owner="New owner (including @ will tag this person/group)",
     description="New task description"
 )
+@app_commands.autocomplete(name=timer_name_autocomplete)
 @app_commands.choices(interval_unit=[
     app_commands.Choice(name="Days", value="days"),
     app_commands.Choice(name="Weeks", value="weeks"),
     app_commands.Choice(name="Months", value="months")
 ])
-async def edit_timer(interaction: discord.Interaction, name: str, interval_value: int = None, 
+async def edit_timer(interaction: discord.Interaction, name: str, interval_value: int = None,
                      interval_unit: str = None, owner: str = None, description: str = None):
     """Edits an existing maintenance timer."""
     if not interaction.guild:
@@ -682,14 +768,14 @@ async def edit_timer(interaction: discord.Interaction, name: str, interval_value
         return
         
     guild_id = interaction.guild.id
-    
+
     # Check if the timer exists
-    if guild_id not in timers or name not in timers[guild_id]:
+    if guild_id not in timers or name not in timers[guild_id].get("timers", {}):
         await interaction.response.send_message(f"❌ Error: Timer '{name}' not found.", ephemeral=True)
         return
-    
+
     # Get the current timer data
-    timer_data = timers[guild_id][name]
+    timer_data = timers[guild_id]["timers"][name]
     
     # Track if any changes were made
     changes_made = False
@@ -730,10 +816,10 @@ async def edit_timer(interaction: discord.Interaction, name: str, interval_value
         # If interval was changed, update the next_due date unless it's pending
         if (interval_value is not None or interval_unit is not None) and not timer_data.get("is_pending", False):
             next_due_time = calculate_next_due(
-                timer_data["interval_value"], 
+                timer_data["interval_value"],
                 timer_data["interval_unit"],
                 # Use the original due date as the starting point if available
-                start_time=datetime.utcnow()
+                start_time=datetime.now(timezone.utc)
             )
             if not next_due_time:
                 await interaction.response.send_message(f"❌ Error: Could not calculate next due date with unit '{timer_data['interval_unit']}'.", ephemeral=True)
@@ -812,7 +898,7 @@ async def help_command(interaction: discord.Interaction):
         inline=False
     )
     
-    embed.set_footer(text="All timers use UTC time zone.")
+    embed.set_footer(text="Times are shown in your local timezone automatically.")
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -877,10 +963,9 @@ if __name__ == "__main__":
     # Validation for BOT_TOKEN already happened earlier
     try:
         # Create necessary directories if they don't exist
-        data_dir = os.path.dirname(DATA_FILE)
-        if not os.path.exists(data_dir):
-            os.makedirs(data_dir)
-            logger.info(f"Created data directory: {data_dir}")
+        if not os.path.exists(DATA_DIR):
+            os.makedirs(DATA_DIR)
+            logger.info(f"Created data directory: {DATA_DIR}")
             
         logger.info("Starting bot...")
         bot.run(BOT_TOKEN)
